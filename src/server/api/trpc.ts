@@ -6,11 +6,14 @@
  * TL;DR - This is where all the tRPC server stuff is created and plugged in. The pieces you will
  * need to use are documented accordingly near the end.
  */
-import { initTRPC } from "@trpc/server";
+import { initTRPC, TRPCError } from "@trpc/server";
 import superjson from "superjson";
 import { ZodError } from "zod";
 
 import { db } from "@/server/db";
+import { auth } from "@/lib/auth";
+import { env } from "@/env";
+import { getCustomUserFromAuthId } from "@/lib/user-utils";
 
 /**
  * 1. CONTEXT
@@ -25,8 +28,15 @@ import { db } from "@/server/db";
  * @see https://trpc.io/docs/server/context
  */
 export const createTRPCContext = async (opts: { headers: Headers }) => {
+  // Get session from Better Auth
+  const session = await auth.api.getSession({
+    headers: opts.headers,
+  });
+
   return {
     db,
+    session,
+    user: session?.user ?? null,
     ...opts,
   };
 };
@@ -104,3 +114,59 @@ const timingMiddleware = t.middleware(async ({ next, path }) => {
  * are logged in.
  */
 export const publicProcedure = t.procedure.use(timingMiddleware);
+
+/**
+ * Protected (authenticated) procedure
+ *
+ * If you want a query or mutation to ONLY be accessible to logged in users, use this. It verifies
+ * the session is valid and guarantees `ctx.session.user` is not null.
+ */
+export const protectedProcedure = t.procedure
+  .use(timingMiddleware)
+  .use(({ ctx, next }) => {
+    if (!ctx.session?.user) {
+      throw new TRPCError({ code: "UNAUTHORIZED" });
+    }
+    return next({
+      ctx: {
+        ...ctx,
+        // infers the `session` as non-nullable
+        session: { ...ctx.session, user: ctx.session.user },
+      },
+    });
+  });
+
+/**
+ * Admin procedure
+ *
+ * If you want a query or mutation to ONLY be accessible to admin users, use this. It verifies
+ * the session is valid and the user is an admin.
+ */
+export const adminProcedure = t.procedure
+  .use(timingMiddleware)
+  .use(async ({ ctx, next }) => {
+    if (!ctx.session?.user) {
+      throw new TRPCError({ code: "UNAUTHORIZED" });
+    }
+    
+    // Check if user is admin by email first (quick check)
+    let isAdmin = ctx.session.user.email === env.ADMIN_EMAIL;
+    
+    // If not admin by email, check the custom user table
+    if (!isAdmin) {
+      const customUser = await getCustomUserFromAuthId(ctx.session.user.id);
+      isAdmin = customUser?.role === 'admin';
+    }
+    
+    if (!isAdmin) {
+      throw new TRPCError({ code: "FORBIDDEN" });
+    }
+    
+    return next({
+      ctx: {
+        ...ctx,
+        // infers the `session` as non-nullable
+        session: { ...ctx.session, user: ctx.session.user },
+      },
+    });
+  });
