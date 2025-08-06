@@ -4,6 +4,9 @@ import { users, repositories, permissions, extensions } from "@/server/db/schema
 import { eq, desc, and, like, count } from "drizzle-orm";
 import { getCustomUserIdFromAuthId } from "@/lib/user-utils";
 import { TRPCError } from "@trpc/server";
+import { getDockerService } from "@/server/services/docker";
+import { getSessionManager } from "@/server/services/session-manager";
+import { getSecurityService } from "@/server/services/security";
 
 // Validation schemas for admin operations
 const userRoleSchema = z.enum(["admin", "user"]);
@@ -161,7 +164,7 @@ export const adminRouter = createTRPCRouter({
       // 1. Validate the Git URL is accessible
       // 2. Generate deploy keys for the repository
       // 3. Store the keys securely
-      
+
       const [newRepository] = await ctx.db
         .insert(repositories)
         .values({
@@ -644,7 +647,7 @@ export const adminRouter = createTRPCRouter({
     )
     .query(async ({ input, ctx }) => {
       const conditions = [like(extensions.name, `%${input.query}%`)];
-      
+
       if (input.enabled !== undefined) {
         conditions.push(eq(extensions.enabled, input.enabled));
       }
@@ -731,12 +734,280 @@ export const adminRouter = createTRPCRouter({
           .set({ role: input.role })
           .where(eq(users.id, userId))
           .returning();
-        
+
         if (updatedUser) {
           updatedUsers.push(updatedUser);
         }
       }
 
       return updatedUsers;
+    }),
+
+  /**
+   * Get security metrics and violations
+   */
+  getSecurityMetrics: adminProcedure.query(async ({ ctx }) => {
+    try {
+      const securityService = getSecurityService();
+      const dockerService = getDockerService();
+
+      // Get security metrics
+      const securityMetrics = securityService.getSecurityMetrics();
+
+      // Get system stats with security information
+      const systemStats = await dockerService.getSystemStats();
+
+      return {
+        violations: securityMetrics,
+        systemStats: systemStats.securityMetrics,
+        containerStats: {
+          total: systemStats.containerCount,
+          cpuUsage: systemStats.totalCpuUsage,
+          memoryUsage: systemStats.totalMemoryUsage,
+        },
+      };
+    } catch (error) {
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to get security metrics",
+        cause: error,
+      });
+    }
+  }),
+
+  /**
+   * Get security violations for a specific user
+   */
+  getUserSecurityViolations: adminProcedure
+    .input(
+      z.object({
+        userId: z.number().positive("User ID must be positive"),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      try {
+        const securityService = getSecurityService();
+        return securityService.getUserViolations(input.userId);
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to get user security violations",
+          cause: error,
+        });
+      }
+    }),
+
+  /**
+   * Monitor all active sessions for security compliance
+   */
+  monitorSessionSecurity: adminProcedure.query(async ({ ctx }) => {
+    try {
+      const sessionManager = getSessionManager();
+      const healthChecks = await sessionManager.performHealthChecks();
+
+      return healthChecks.map(check => ({
+        sessionId: check.sessionId,
+        healthy: check.healthy,
+        securityCompliant: check.securityCompliant ?? false,
+        securityViolations: check.securityViolations ?? [],
+        resourceUsage: check.resourceUsage,
+        error: check.error,
+      }));
+    } catch (error) {
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to monitor session security",
+        cause: error,
+      });
+    }
+  }),
+
+
+
+  /**
+   * Get detailed container security information
+   */
+  getContainerSecurity: adminProcedure
+    .input(
+      z.object({
+        containerId: z.string().min(1, "Container ID is required"),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      try {
+        const dockerService = getDockerService();
+        return await dockerService.monitorContainerSecurity(input.containerId);
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to get container security information",
+          cause: error,
+        });
+      }
+    }),
+
+  /**
+   * Clear old security violations (cleanup)
+   */
+  clearOldSecurityViolations: adminProcedure
+    .input(
+      z.object({
+        olderThanDays: z.number().min(1).max(365).default(30),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      try {
+        const securityService = getSecurityService();
+        const clearedCount = securityService.clearOldViolations(input.olderThanDays);
+
+        return {
+          success: true,
+          clearedCount,
+          message: `Cleared ${clearedCount} security violations older than ${input.olderThanDays} days`,
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to clear old security violations",
+          cause: error,
+        });
+      }
+    }),
+
+  /**
+   * Perform comprehensive security audit on all sessions
+   */
+  performSecurityAudit: adminProcedure.query(async ({ ctx }) => {
+    try {
+      const sessionManager = getSessionManager();
+      const auditResults = await sessionManager.performSecurityAudit();
+
+      return {
+        success: true,
+        audits: auditResults,
+        summary: {
+          totalSessions: auditResults.length,
+          compliantSessions: auditResults.filter(a => a.audit.compliant).length,
+          criticalRisk: auditResults.filter(a => a.audit.riskLevel === 'critical').length,
+          highRisk: auditResults.filter(a => a.audit.riskLevel === 'high').length,
+          mediumRisk: auditResults.filter(a => a.audit.riskLevel === 'medium').length,
+          lowRisk: auditResults.filter(a => a.audit.riskLevel === 'low').length,
+        },
+      };
+    } catch (error) {
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Failed to perform security audit",
+        cause: error,
+      });
+    }
+  }),
+
+  /**
+   * Validate terminal command for a specific session
+   */
+  validateTerminalCommand: adminProcedure
+    .input(
+      z.object({
+        sessionId: z.string(),
+        command: z.string(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      try {
+        const sessionManager = getSessionManager();
+        const result = await sessionManager.validateTerminalCommand(input.sessionId, input.command);
+
+        return {
+          success: true,
+          allowed: result.allowed,
+          reason: result.reason,
+          command: input.command,
+          sessionId: input.sessionId,
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to validate terminal command",
+          cause: error,
+        });
+      }
+    }),
+
+  /**
+   * Validate file access for a specific session
+   */
+  validateFileAccess: adminProcedure
+    .input(
+      z.object({
+        sessionId: z.string(),
+        filePath: z.string(),
+        operation: z.enum(['read', 'write', 'execute']),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      try {
+        const sessionManager = getSessionManager();
+        const result = await sessionManager.validateFileAccess(
+          input.sessionId,
+          input.filePath,
+          input.operation
+        );
+
+        return {
+          success: true,
+          allowed: result.allowed,
+          reason: result.reason,
+          filePath: input.filePath,
+          operation: input.operation,
+          sessionId: input.sessionId,
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to validate file access",
+          cause: error,
+        });
+      }
+    }),
+
+  /**
+   * Validate network access for a specific session
+   */
+  validateNetworkAccess: adminProcedure
+    .input(
+      z.object({
+        sessionId: z.string(),
+        destination: z.string(),
+        port: z.number().min(1).max(65535),
+        protocol: z.enum(['tcp', 'udp']).default('tcp'),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      try {
+        const sessionManager = getSessionManager();
+        const result = await sessionManager.validateNetworkAccess(
+          input.sessionId,
+          input.destination,
+          input.port,
+          input.protocol
+        );
+
+        return {
+          success: true,
+          allowed: result.allowed,
+          reason: result.reason,
+          destination: input.destination,
+          port: input.port,
+          protocol: input.protocol,
+          sessionId: input.sessionId,
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to validate network access",
+          cause: error,
+        });
+      }
     }),
 });

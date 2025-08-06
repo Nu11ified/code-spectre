@@ -14,6 +14,9 @@ import { db } from "@/server/db";
 import { auth } from "@/lib/auth";
 import { env } from "@/env";
 import { getCustomUserFromAuthId } from "@/lib/user-utils";
+import { apiLogger, createTimer } from "@/lib/logger";
+import { AppError, ErrorHandler, globalErrorHandler } from "@/lib/errors";
+import { ensureServicesInitialized } from "@/server/init";
 
 /**
  * 1. CONTEXT
@@ -28,18 +31,41 @@ import { getCustomUserFromAuthId } from "@/lib/user-utils";
  * @see https://trpc.io/docs/server/context
  */
 export const createTRPCContext = async (opts: { headers: Headers }) => {
+  // Ensure services are initialized
+  await ensureServicesInitialized();
+  
+  // Generate request ID for tracing
+  const requestId = generateRequestId();
+  
   // Get session from Better Auth
   const session = await auth.api.getSession({
     headers: opts.headers,
+  });
+
+  // Create logger with request context
+  const logger = apiLogger.child({
+    requestId,
+    userId: session?.user?.id,
+    userEmail: session?.user?.email,
   });
 
   return {
     db,
     session,
     user: session?.user ?? null,
+    logger,
+    requestId,
+    errorHandler: new ErrorHandler(logger),
     ...opts,
   };
 };
+
+/**
+ * Generate unique request ID for tracing
+ */
+function generateRequestId(): string {
+  return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
 
 /**
  * 2. INITIALIZATION
@@ -50,13 +76,67 @@ export const createTRPCContext = async (opts: { headers: Headers }) => {
  */
 const t = initTRPC.context<typeof createTRPCContext>().create({
   transformer: superjson,
-  errorFormatter({ shape, error }) {
+  errorFormatter({ shape, error, ctx }) {
+    // Enhanced error formatting with logging and user-friendly messages
+    const logger = ctx?.logger || apiLogger;
+    
+    // Log the error with context
+    if (error.cause instanceof AppError) {
+      // AppError is already handled by ErrorHandler
+      const userFriendlyMessage = globalErrorHandler.createUserFriendlyMessage(error.cause);
+      const recoverySuggestions = globalErrorHandler.getRecoverySuggestions(error.cause);
+      
+      return {
+        ...shape,
+        message: userFriendlyMessage,
+        data: {
+          ...shape.data,
+          code: error.cause.code,
+          suggestions: recoverySuggestions,
+          zodError: null,
+          timestamp: error.cause.timestamp.toISOString(),
+        },
+      };
+    }
+    
+    if (error.cause instanceof ZodError) {
+      logger.warn('Validation error in tRPC procedure', {
+        zodError: error.cause.flatten(),
+      });
+      
+      return {
+        ...shape,
+        message: 'Invalid input provided',
+        data: {
+          ...shape.data,
+          zodError: error.cause.flatten(),
+          suggestions: ['Please check your input and try again'],
+        },
+      };
+    }
+    
+    // Handle unexpected errors
+    if (error.code === 'INTERNAL_SERVER_ERROR') {
+      logger.error('Unhandled error in tRPC procedure', error.cause, {
+        code: error.code,
+      });
+      
+      return {
+        ...shape,
+        message: 'An unexpected error occurred. Please try again.',
+        data: {
+          ...shape.data,
+          suggestions: ['Try again in a few moments', 'Contact support if the problem persists'],
+          zodError: null,
+        },
+      };
+    }
+    
     return {
       ...shape,
       data: {
         ...shape.data,
-        zodError:
-          error.cause instanceof ZodError ? error.cause.flatten() : null,
+        zodError: null,
       },
     };
   },
@@ -84,13 +164,20 @@ export const createCallerFactory = t.createCallerFactory;
 export const createTRPCRouter = t.router;
 
 /**
- * Middleware for timing procedure execution and adding an artificial delay in development.
- *
- * You can remove this if you don't like it, but it can help catch unwanted waterfalls by simulating
- * network latency that would occur in production but not in local development.
+ * Enhanced middleware for timing, logging, and error handling
  */
-const timingMiddleware = t.middleware(async ({ next, path }) => {
-  const start = Date.now();
+const loggingMiddleware = t.middleware(async ({ next, path, ctx, type, input }) => {
+  const timer = createTimer(ctx.logger, `${type}:${path}`, {
+    path,
+    type,
+    userId: ctx.user?.id,
+    requestId: ctx.requestId,
+  });
+
+  // Log procedure start
+  ctx.logger.debug(`Starting ${type} procedure: ${path}`, {
+    input: type === 'query' ? input : '[REDACTED]', // Don't log mutation inputs for security
+  });
 
   if (t._config.isDev) {
     // artificial delay in dev
@@ -98,12 +185,41 @@ const timingMiddleware = t.middleware(async ({ next, path }) => {
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
 
-  const result = await next();
+  try {
+    const result = await next();
+    
+    const duration = timer.end({
+      success: true,
+      resultSize: JSON.stringify(result).length,
+    });
 
-  const end = Date.now();
-  console.log(`[TRPC] ${path} took ${end - start}ms to execute`);
+    // Log slow procedures
+    if (duration > 2000) {
+      ctx.logger.warn(`Slow procedure detected: ${path}`, {
+        duration,
+        path,
+        type,
+      });
+    }
 
-  return result;
+    return result;
+  } catch (error) {
+    timer.endWithError(error, {
+      success: false,
+      errorType: error instanceof Error ? error.constructor.name : 'Unknown',
+    });
+
+    // Handle and convert errors
+    const handledError = ctx.errorHandler.handleError(error, {
+      path,
+      type,
+      userId: ctx.user?.id,
+      requestId: ctx.requestId,
+    });
+
+    // Convert to tRPC error
+    throw handledError.toTRPCError();
+  }
 });
 
 /**
@@ -113,7 +229,7 @@ const timingMiddleware = t.middleware(async ({ next, path }) => {
  * guarantee that a user querying is authorized, but you can still access user session data if they
  * are logged in.
  */
-export const publicProcedure = t.procedure.use(timingMiddleware);
+export const publicProcedure = t.procedure.use(loggingMiddleware);
 
 /**
  * Protected (authenticated) procedure
@@ -122,11 +238,28 @@ export const publicProcedure = t.procedure.use(timingMiddleware);
  * the session is valid and guarantees `ctx.session.user` is not null.
  */
 export const protectedProcedure = t.procedure
-  .use(timingMiddleware)
+  .use(loggingMiddleware)
   .use(({ ctx, next }) => {
     if (!ctx.session?.user) {
-      throw new TRPCError({ code: "UNAUTHORIZED" });
+      ctx.logger.warn('Unauthorized access attempt', {
+        path: 'protected-procedure',
+        hasSession: !!ctx.session,
+        requestId: ctx.requestId,
+      });
+      throw new AppError(
+        'UNAUTHORIZED' as any,
+        'Authentication required',
+        401,
+        true,
+        { requestId: ctx.requestId }
+      ).toTRPCError();
     }
+    
+    ctx.logger.debug('Authenticated user accessing protected procedure', {
+      userId: ctx.session.user.id,
+      userEmail: ctx.session.user.email,
+    });
+    
     return next({
       ctx: {
         ...ctx,
@@ -143,10 +276,21 @@ export const protectedProcedure = t.procedure
  * the session is valid and the user is an admin.
  */
 export const adminProcedure = t.procedure
-  .use(timingMiddleware)
+  .use(loggingMiddleware)
   .use(async ({ ctx, next }) => {
     if (!ctx.session?.user) {
-      throw new TRPCError({ code: "UNAUTHORIZED" });
+      ctx.logger.warn('Unauthorized admin access attempt', {
+        path: 'admin-procedure',
+        hasSession: !!ctx.session,
+        requestId: ctx.requestId,
+      });
+      throw new AppError(
+        'UNAUTHORIZED' as any,
+        'Authentication required',
+        401,
+        true,
+        { requestId: ctx.requestId }
+      ).toTRPCError();
     }
     
     // Check if user is admin by email first (quick check)
@@ -154,13 +298,47 @@ export const adminProcedure = t.procedure
     
     // If not admin by email, check the custom user table
     if (!isAdmin) {
-      const customUser = await getCustomUserFromAuthId(ctx.session.user.id);
-      isAdmin = customUser?.role === 'admin';
+      try {
+        const customUser = await getCustomUserFromAuthId(ctx.session.user.id);
+        isAdmin = customUser?.role === 'admin';
+      } catch (error) {
+        ctx.logger.error('Failed to check admin status', error, {
+          userId: ctx.session.user.id,
+          requestId: ctx.requestId,
+        });
+        throw new AppError(
+          'DATABASE_ERROR' as any,
+          'Failed to verify admin permissions',
+          500,
+          true,
+          { requestId: ctx.requestId }
+        ).toTRPCError();
+      }
     }
     
     if (!isAdmin) {
-      throw new TRPCError({ code: "FORBIDDEN" });
+      ctx.logger.warn('Forbidden admin access attempt', {
+        userId: ctx.session.user.id,
+        userEmail: ctx.session.user.email,
+        requestId: ctx.requestId,
+      });
+      throw new AppError(
+        'FORBIDDEN' as any,
+        'Admin privileges required',
+        403,
+        true,
+        { 
+          userId: ctx.session.user.id,
+          requestId: ctx.requestId 
+        }
+      ).toTRPCError();
     }
+    
+    ctx.logger.debug('Admin user accessing admin procedure', {
+      userId: ctx.session.user.id,
+      userEmail: ctx.session.user.email,
+      adminMethod: isAdmin ? 'email' : 'database',
+    });
     
     return next({
       ctx: {

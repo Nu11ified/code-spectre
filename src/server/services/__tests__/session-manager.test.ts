@@ -418,6 +418,13 @@ describe('SessionManager', () => {
         containerCount: 2,
         totalCpuUsage: 45.2,
         totalMemoryUsage: 1024 * 1024 * 1024, // 1GB
+        securityMetrics: {
+          totalViolations: 0,
+          violationsByType: {},
+          violationsByUser: {},
+          blockedActions: 0,
+          activeThreats: 0,
+        },
       };
 
       vi.mocked(mockDockerService.listContainers).mockResolvedValue(mockContainers);

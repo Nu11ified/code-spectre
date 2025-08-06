@@ -222,3 +222,68 @@ export interface Metrics {
   };
   errorRates: Record<ErrorCode, number>;
 }
+
+/**
+ * Security violation types
+ */
+export enum SecurityViolationType {
+  UNAUTHORIZED_NETWORK_ACCESS = 'UNAUTHORIZED_NETWORK_ACCESS',
+  UNAUTHORIZED_FILE_ACCESS = 'UNAUTHORIZED_FILE_ACCESS',
+  UNAUTHORIZED_COMMAND = 'UNAUTHORIZED_COMMAND',
+  RESOURCE_LIMIT_EXCEEDED = 'RESOURCE_LIMIT_EXCEEDED',
+  TERMINAL_ACCESS_DENIED = 'TERMINAL_ACCESS_DENIED',
+  CONTAINER_ESCAPE_ATTEMPT = 'CONTAINER_ESCAPE_ATTEMPT',
+}
+
+/**
+ * Security violation event
+ */
+export interface SecurityViolation {
+  id: string;
+  type: SecurityViolationType;
+  userId: number;
+  sessionId: string;
+  timestamp: Date;
+  details: {
+    action: string;
+    resource: string;
+    blocked: boolean;
+    severity: 'low' | 'medium' | 'high' | 'critical';
+  };
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Security metrics for monitoring
+ */
+export interface SecurityMetrics {
+  totalViolations: number;
+  violationsByType: Record<SecurityViolationType, number>;
+  violationsByUser: Record<number, number>;
+  blockedActions: number;
+  activeThreats: number;
+  lastViolation?: Date;
+}
+
+/**
+ * Container security compliance status
+ */
+export interface ContainerSecurityStatus {
+  compliant: boolean;
+  violations: string[];
+  resourceUsage: {
+    cpu: number;
+    memory: number;
+    memoryLimit: number;
+  };
+}
+
+/**
+ * Terminal command validation result
+ */
+export interface CommandValidationResult {
+  allowed: boolean;
+  reason?: string;
+  command: string;
+  sessionId: string;
+}

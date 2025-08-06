@@ -68,7 +68,7 @@ http:
           - Authorization
           - X-Requested-With
         accessControlAllowOriginList:
-          - "https://*.${DOMAIN:-localhost}"
+          - "https://*.localhost"
           - "http://localhost:3000"
         accessControlMaxAge: 86400
 
@@ -111,7 +111,7 @@ tls:
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: "${ACME_EMAIL:-admin@example.com}"
+      email: "admin@example.com"
       storage: "/letsencrypt/acme.json"
       tlsChallenge: {}
       # Alternative: HTTP challenge for environments where TLS challenge doesn't work

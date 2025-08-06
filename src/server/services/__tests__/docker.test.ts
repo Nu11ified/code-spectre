@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import { DockerService, createDefaultDockerConfig, type DockerServiceConfig } from '../docker';
 import type { ContainerInfo, ContainerStats } from '../docker';
+import type { UserPermissions } from '@/types/domain';
 
 // Mock dockerode
 const mockDocker = {
@@ -76,11 +77,34 @@ describe('DockerService', () => {
 
       await dockerService.initialize();
 
+      // Should create both main network and isolated network
       expect(mockDocker.createNetwork).toHaveBeenCalledWith({
         Name: 'test-network',
         Driver: 'bridge',
         Labels: {
           'cloud-ide-orchestrator.managed': 'true',
+        },
+      });
+      
+      expect(mockDocker.createNetwork).toHaveBeenCalledWith({
+        Name: 'cloud-ide-isolated',
+        Driver: 'bridge',
+        Internal: true,
+        Labels: {
+          'cloud-ide-orchestrator.managed': 'true',
+          'cloud-ide-orchestrator.type': 'isolated',
+        },
+        IPAM: {
+          Driver: 'default',
+          Config: [{
+            Subnet: '172.20.0.0/16',
+            Gateway: '172.20.0.1',
+          }],
+        },
+        Options: {
+          'com.docker.network.bridge.enable_icc': 'false',
+          'com.docker.network.bridge.enable_ip_masquerade': 'false',
+          'com.docker.network.driver.mtu': '1500',
         },
       });
     });
@@ -128,7 +152,12 @@ describe('DockerService', () => {
         branchName: 'main',
         worktreePath: '/srv/worktrees/repo_1/user_1/main',
         extensionsPath: '/srv/extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       expect(mockDocker.createContainer).toHaveBeenCalledWith(
@@ -167,7 +196,12 @@ describe('DockerService', () => {
         branchName: 'main',
         worktreePath: '/srv/worktrees/repo_1/user_1/main',
         extensionsPath: '/srv/extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       expect(mockDocker.createContainer).not.toHaveBeenCalled();
@@ -194,7 +228,12 @@ describe('DockerService', () => {
         branchName: 'main',
         worktreePath: '/srv/worktrees/repo_1/user_1/main',
         extensionsPath: '/srv/extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       })).rejects.toThrow('Maximum container limit reached');
     });
 
@@ -223,7 +262,12 @@ describe('DockerService', () => {
         branchName: 'main',
         worktreePath: '/srv/worktrees/repo_1/user_1/main',
         extensionsPath: '/srv/extensions',
-        terminalAccess: false,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: false,
+        },
       });
 
       expect(mockDocker.createContainer).toHaveBeenCalledWith(
@@ -520,7 +564,7 @@ describe('DockerService', () => {
         socketPath: '/var/run/docker.sock',
         defaultImage: 'codercom/code-server:latest',
         networkName: 'cloud-ide-network',
-        baseUrl: 'http://localhost:3000',
+        baseUrl: 'localhost',
         sessionTimeoutMinutes: 60,
         maxContainers: 50,
         defaultResources: {
@@ -534,14 +578,45 @@ describe('DockerService', () => {
       const service = new DockerService(config);
       
       // Test private method through container creation
-      const containerConfig = (service as any).buildContainerConfig({
+      const mockSecurityProfile = {
+        userId: 1,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
+        networkRestrictions: {
+          allowedHosts: ['127.0.0.1'],
+          blockedPorts: [22, 23],
+          enableInternet: false,
+        },
+        fileSystemRestrictions: {
+          allowedPaths: ['/home/coder/workspace'],
+          readOnlyPaths: ['/etc', '/usr'],
+          maxFileSize: 100 * 1024 * 1024,
+        },
+        resourceLimits: {
+          memory: '2g',
+          cpu: '1.0',
+          diskQuota: '5g',
+        },
+        terminalRestrictions: {
+          enabled: true,
+          allowedCommands: ['ls', 'cd'],
+          blockedCommands: ['rm -rf'],
+          timeout: 3600,
+        },
+      };
+
+      const containerConfig = (service as any).buildSecureContainerConfig({
         name: 'test',
         userId: 1,
         repositoryId: 1,
         branchName: 'main',
         worktreePath: '/test',
         extensionsPath: '/test',
-        terminalAccess: true,
+        securityProfile: mockSecurityProfile,
       });
 
       expect(containerConfig.HostConfig.Memory).toBe(2 * 1024 * 1024 * 1024); // 2GB in bytes
@@ -550,14 +625,45 @@ describe('DockerService', () => {
     it('should parse CPU limits correctly', () => {
       const service = new DockerService(config);
       
-      const containerConfig = (service as any).buildContainerConfig({
+      const mockSecurityProfile = {
+        userId: 1,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
+        networkRestrictions: {
+          allowedHosts: ['127.0.0.1'],
+          blockedPorts: [22, 23],
+          enableInternet: false,
+        },
+        fileSystemRestrictions: {
+          allowedPaths: ['/home/coder/workspace'],
+          readOnlyPaths: ['/etc', '/usr'],
+          maxFileSize: 100 * 1024 * 1024,
+        },
+        resourceLimits: {
+          memory: '2g',
+          cpu: '1.0',
+          diskQuota: '5g',
+        },
+        terminalRestrictions: {
+          enabled: true,
+          allowedCommands: ['ls', 'cd'],
+          blockedCommands: ['rm -rf'],
+          timeout: 3600,
+        },
+      };
+
+      const containerConfig = (service as any).buildSecureContainerConfig({
         name: 'test',
         userId: 1,
         repositoryId: 1,
         branchName: 'main',
         worktreePath: '/test',
         extensionsPath: '/test',
-        terminalAccess: true,
+        securityProfile: mockSecurityProfile,
       });
 
       expect(containerConfig.HostConfig.CpuQuota).toBe(100000); // 1.0 CPU = 100000 microseconds
@@ -580,7 +686,12 @@ describe('DockerService', () => {
         branchName: 'main',
         worktreePath: '/srv/worktrees/repo_1/user_1/main',
         extensionsPath: '/srv/extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       })).rejects.toThrow('Container creation failed');
 
       expect(mockLogger).toHaveBeenCalledWith('error', 'Failed to create IDE container', expect.any(Object));

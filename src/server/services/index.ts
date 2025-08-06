@@ -3,6 +3,7 @@ export { GitService, type GitServiceConfig, createDefaultGitConfig, getGitServic
 export { DockerService, type DockerServiceConfig, createDefaultDockerConfig, getDockerService } from './docker';
 export { SessionManager, type SessionManagerConfig, createDefaultSessionManagerConfig, getSessionManager } from './session-manager';
 export { TraefikService, type TraefikConfig, createDefaultTraefikConfig, getTraefikService } from './traefik';
+export { SecurityService, type SecurityConfig, createDefaultSecurityConfig, getSecurityService } from './security';
 
 // Service initialization
 export async function initializeServices(): Promise<void> {

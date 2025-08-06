@@ -1,6 +1,10 @@
 import { getDockerService } from './docker';
 import { getGitService } from './git';
 import type { IdeSession, UserPermissions } from '@/types/domain';
+import { sessionLogger, createTimer } from '@/lib/logger';
+import { AppError, ErrorCode, ErrorHandler } from '@/lib/errors';
+import { recoveryService, handleErrorWithRecovery } from '@/lib/recovery';
+import { monitoringService } from '@/lib/monitoring';
 
 export interface SessionManagerConfig {
   extensionsPath: string; // Path to shared extensions directory
@@ -28,16 +32,11 @@ export class SessionManager {
   private config: SessionManagerConfig;
   private dockerService = getDockerService();
   private gitService = getGitService();
-  private logger: (level: 'info' | 'warn' | 'error', message: string, metadata?: any) => void;
+  private logger = sessionLogger;
+  private errorHandler = new ErrorHandler(sessionLogger);
 
-  constructor(
-    config: SessionManagerConfig,
-    logger?: (level: 'info' | 'warn' | 'error', message: string, metadata?: any) => void
-  ) {
+  constructor(config: SessionManagerConfig) {
     this.config = config;
-    this.logger = logger || ((level, message, metadata) => {
-      console[level](`[SessionManager] ${message}`, metadata || '');
-    });
   }
 
   /**
@@ -45,88 +44,142 @@ export class SessionManager {
    * This demonstrates the integration between Git and Docker services
    */
   async createSession(params: CreateSessionParams): Promise<SessionInfo> {
-    try {
-      this.logger('info', 'Creating IDE session', {
-        userId: params.userId,
-        repositoryId: params.repositoryId,
-        branchName: params.branchName,
-      });
+    const timer = createTimer(this.logger, 'createSession', {
+      userId: params.userId,
+      repositoryId: params.repositoryId,
+      branchName: params.branchName,
+    });
 
-      // Step 1: Validate permissions
-      await this.validateSessionPermissions(params);
-
-      // Step 2: Check for existing session
-      const existingSession = await this.findExistingSession(params);
-      if (existingSession) {
-        this.logger('info', 'Reusing existing IDE session', {
+    return await handleErrorWithRecovery(
+      async () => {
+        this.logger.info('Creating IDE session', {
           userId: params.userId,
           repositoryId: params.repositoryId,
           branchName: params.branchName,
-          sessionId: existingSession.sessionId,
         });
-        return existingSession;
-      }
 
-      // Step 3: Prepare the worktree using Git service
-      const worktreeResult = await this.gitService.createWorktree(
-        params.repositoryId,
-        params.branchName,
-        params.userId
-      );
+        // Step 1: Validate permissions
+        await this.validateSessionPermissions(params);
 
-      if (!worktreeResult.success) {
-        throw new Error(`Failed to create worktree: ${worktreeResult.error}`);
-      }
+        // Step 2: Check for existing session
+        const existingSession = await this.findExistingSession(params);
+        if (existingSession) {
+          this.logger.info('Reusing existing IDE session', {
+            userId: params.userId,
+            repositoryId: params.repositoryId,
+            branchName: params.branchName,
+            sessionId: existingSession.sessionId,
+          });
+          timer.end({ reused: true });
+          return existingSession;
+        }
 
-      const worktreePath = this.gitService.getWorktreePath(
-        params.repositoryId,
-        params.branchName,
-        params.userId
-      );
+        // Step 3: Prepare the worktree using Git service
+        const worktreeResult = await this.gitService.createWorktree(
+          params.repositoryId,
+          params.branchName,
+          params.userId
+        );
 
-      // Step 4: Create and start the Docker container
-      const containerInfo = await this.dockerService.createIdeContainer({
+        if (!worktreeResult.success) {
+          throw new AppError(
+            ErrorCode.GIT_WORKTREE_CREATION_FAILED,
+            `Failed to create worktree: ${worktreeResult.error}`,
+            500,
+            true,
+            {
+              repositoryId: params.repositoryId,
+              branchName: params.branchName,
+              userId: params.userId,
+            }
+          );
+        }
+
+        const worktreePath = this.gitService.getWorktreePath(
+          params.repositoryId,
+          params.branchName,
+          params.userId
+        );
+
+        // Step 4: Create and start the Docker container with security profile
+        let containerInfo;
+        try {
+          containerInfo = await this.dockerService.createIdeContainer({
+            userId: params.userId,
+            repositoryId: params.repositoryId,
+            branchName: params.branchName,
+            worktreePath,
+            extensionsPath: this.config.extensionsPath,
+            permissions: params.permissions,
+          });
+        } catch (error) {
+          throw new AppError(
+            ErrorCode.CONTAINER_CREATION_FAILED,
+            `Failed to create container: ${error}`,
+            500,
+            true,
+            {
+              userId: params.userId,
+              repositoryId: params.repositoryId,
+              branchName: params.branchName,
+            }
+          );
+        }
+
+        // Step 5: Generate unique session URL
+        const sessionUrl = this.generateUniqueSessionUrl(containerInfo.name, params);
+
+        // Step 6: Wait for container to be ready
+        await this.waitForContainerReady(containerInfo.id);
+
+        const sessionInfo: SessionInfo = {
+          sessionId: containerInfo.id,
+          containerUrl: sessionUrl,
+          status: containerInfo.status === 'running' ? 'running' : 'starting',
+          createdAt: containerInfo.created,
+        };
+
+        timer.end({
+          containerId: containerInfo.id,
+          sessionUrl,
+          success: true,
+        });
+
+        this.logger.info('IDE session created successfully', {
+          userId: params.userId,
+          repositoryId: params.repositoryId,
+          branchName: params.branchName,
+          containerId: containerInfo.id,
+          sessionUrl,
+        });
+
+        // Record successful session creation for monitoring
+        monitoringService.recordResponseTime(timer.end());
+
+        return sessionInfo;
+      },
+      {
         userId: params.userId,
         repositoryId: params.repositoryId,
         branchName: params.branchName,
-        worktreePath,
-        extensionsPath: this.config.extensionsPath,
-        terminalAccess: params.permissions.allowTerminalAccess,
-      });
-
-      // Step 5: Generate unique session URL
-      const sessionUrl = this.generateUniqueSessionUrl(containerInfo.name, params);
-
-      // Step 6: Wait for container to be ready
-      await this.waitForContainerReady(containerInfo.id);
-
-      this.logger('info', 'IDE session created successfully', {
-        userId: params.userId,
-        repositoryId: params.repositoryId,
-        branchName: params.branchName,
-        containerId: containerInfo.id,
-        sessionUrl,
-      });
-
-      return {
-        sessionId: containerInfo.id,
-        containerUrl: sessionUrl,
-        status: containerInfo.status === 'running' ? 'running' : 'starting',
-        createdAt: containerInfo.created,
-      };
-    } catch (error) {
-      this.logger('error', 'Failed to create IDE session', {
-        userId: params.userId,
-        repositoryId: params.repositoryId,
-        branchName: params.branchName,
-        error,
-      });
+      },
+      { enableRecovery: true, maxRetries: 2 }
+    ).catch(async (error) => {
+      timer.endWithError(error);
       
       // Cleanup on failure
       await this.cleanupFailedSession(params);
       
-      throw new Error(`Session creation failed: ${error}`);
-    }
+      // Handle and convert error
+      const handledError = this.errorHandler.handleError(error, {
+        operation: 'createSession',
+        userId: params.userId,
+        repositoryId: params.repositoryId,
+        branchName: params.branchName,
+      });
+
+      throw handledError;
+    });
   }
 
   /**
@@ -134,7 +187,7 @@ export class SessionManager {
    */
   async stopSession(sessionId: string): Promise<void> {
     try {
-      this.logger('info', 'Stopping IDE session', { sessionId });
+      this.logger.info('Stopping IDE session', { sessionId });
 
       // Get container info to extract user and repository details
       const containerInfo = await this.dockerService.getContainerInfo(sessionId);
@@ -150,9 +203,9 @@ export class SessionManager {
         await this.gitService.removeWorktree(repositoryId, branchName, userId);
       }
 
-      this.logger('info', 'IDE session stopped successfully', { sessionId });
+      this.logger.info('IDE session stopped successfully', { sessionId });
     } catch (error) {
-      this.logger('error', 'Failed to stop IDE session', { sessionId, error });
+      this.logger.error('Failed to stop IDE session', error, { sessionId });
       throw new Error(`Session stop failed: ${error}`);
     }
   }
@@ -172,7 +225,7 @@ export class SessionManager {
         createdAt: containerInfo.created,
       };
     } catch (error) {
-      this.logger('error', 'Failed to get session status', { sessionId, error });
+      this.logger.error('Failed to get session status', error, { sessionId });
       throw new Error(`Failed to get session status: ${error}`);
     }
   }
@@ -194,15 +247,22 @@ export class SessionManager {
         createdAt: container.created,
       }));
     } catch (error) {
-      this.logger('error', 'Failed to get user sessions', { userId, error });
+      this.logger.error('Failed to get user sessions', error, { userId });
       throw new Error(`Failed to get user sessions: ${error}`);
     }
   }
 
   /**
-   * Perform comprehensive health checks on all sessions
+   * Perform comprehensive health checks on all sessions with security monitoring
    */
-  async performHealthChecks(): Promise<Array<{ sessionId: string; healthy: boolean; error?: string; resourceUsage?: any }>> {
+  async performHealthChecks(): Promise<Array<{ 
+    sessionId: string; 
+    healthy: boolean; 
+    error?: string; 
+    resourceUsage?: any;
+    securityCompliant?: boolean;
+    securityViolations?: string[];
+  }>> {
     try {
       const containers = await this.dockerService.listContainers();
       const healthChecks = await Promise.all(
@@ -212,9 +272,12 @@ export class SessionManager {
             
             // Get resource usage if container is healthy
             let resourceUsage;
+            let securityCheck;
             if (healthCheck.healthy) {
               try {
                 resourceUsage = await this.dockerService.getContainerStats(container.id);
+                // Perform security monitoring
+                securityCheck = await this.dockerService.monitorContainerSecurity(container.id);
               } catch {
                 // Resource stats not available
               }
@@ -225,6 +288,8 @@ export class SessionManager {
               healthy: healthCheck.healthy,
               error: healthCheck.error,
               resourceUsage,
+              securityCompliant: securityCheck?.compliant,
+              securityViolations: securityCheck?.violations,
             };
           } catch (error) {
             return {
@@ -236,20 +301,134 @@ export class SessionManager {
         })
       );
 
-      // Log summary
+      // Log summary with security metrics
       const healthyCount = healthChecks.filter(c => c.healthy).length;
       const unhealthyCount = healthChecks.length - healthyCount;
+      const securityCompliantCount = healthChecks.filter(c => c.securityCompliant).length;
+      const securityViolationsCount = healthChecks.filter(c => c.securityViolations && c.securityViolations.length > 0).length;
       
-      this.logger('info', 'Health checks completed', {
+      this.logger.info(, 'Health and security checks completed', {
         total: healthChecks.length,
         healthy: healthyCount,
         unhealthy: unhealthyCount,
+        securityCompliant: securityCompliantCount,
+        securityViolations: securityViolationsCount,
       });
 
       return healthChecks;
     } catch (error) {
       this.logger('error', 'Failed to perform health checks', { error });
       throw new Error(`Health check failed: ${error}`);
+    }
+  }
+
+  /**
+   * Validate terminal command execution for a session
+   */
+  async validateTerminalCommand(sessionId: string, command: string): Promise<{ allowed: boolean; reason?: string }> {
+    try {
+      return await this.dockerService.validateTerminalCommand(sessionId, command);
+    } catch (error) {
+      this.logger('error', 'Failed to validate terminal command', { sessionId, command, error });
+      return { allowed: false, reason: 'Validation failed' };
+    }
+  }
+
+  /**
+   * Validate file access for a session
+   */
+  async validateFileAccess(
+    sessionId: string, 
+    filePath: string, 
+    operation: 'read' | 'write' | 'execute'
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    try {
+      return await this.dockerService.validateFileAccess(sessionId, filePath, operation);
+    } catch (error) {
+      this.logger('error', 'Failed to validate file access', { sessionId, filePath, operation, error });
+      return { allowed: false, reason: 'Validation failed' };
+    }
+  }
+
+  /**
+   * Validate network access for a session
+   */
+  async validateNetworkAccess(
+    sessionId: string,
+    destination: string,
+    port: number,
+    protocol: 'tcp' | 'udp' = 'tcp'
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    try {
+      return await this.dockerService.validateNetworkAccess(sessionId, destination, port, protocol);
+    } catch (error) {
+      this.logger('error', 'Failed to validate network access', { sessionId, destination, port, error });
+      return { allowed: false, reason: 'Validation failed' };
+    }
+  }
+
+  /**
+   * Perform comprehensive security audit on all sessions
+   */
+  async performSecurityAudit(): Promise<Array<{
+    sessionId: string;
+    userId: number;
+    repositoryId: number;
+    branchName: string;
+    audit: {
+      compliant: boolean;
+      violations: string[];
+      recommendations: string[];
+      riskLevel: 'low' | 'medium' | 'high' | 'critical';
+    };
+  }>> {
+    try {
+      const containers = await this.dockerService.listContainers();
+      const audits = await Promise.all(
+        containers.map(async container => {
+          try {
+            const audit = await this.dockerService.performSecurityAudit(container.id);
+            
+            return {
+              sessionId: container.id,
+              userId: parseInt(container.labels['cloud-ide-orchestrator.user-id'] || '0'),
+              repositoryId: parseInt(container.labels['cloud-ide-orchestrator.repository-id'] || '0'),
+              branchName: container.labels['cloud-ide-orchestrator.branch-name'] || '',
+              audit,
+            };
+          } catch (error) {
+            return {
+              sessionId: container.id,
+              userId: 0,
+              repositoryId: 0,
+              branchName: '',
+              audit: {
+                compliant: false,
+                violations: [`Audit failed: ${error}`],
+                recommendations: ['Investigate audit failure'],
+                riskLevel: 'critical' as const,
+              },
+            };
+          }
+        })
+      );
+
+      // Log summary
+      const criticalCount = audits.filter(a => a.audit.riskLevel === 'critical').length;
+      const highCount = audits.filter(a => a.audit.riskLevel === 'high').length;
+      const nonCompliantCount = audits.filter(a => !a.audit.compliant).length;
+
+      this.logger.info(, 'Security audit completed', {
+        totalSessions: audits.length,
+        nonCompliant: nonCompliantCount,
+        critical: criticalCount,
+        high: highCount,
+      });
+
+      return audits;
+    } catch (error) {
+      this.logger('error', 'Failed to perform security audit', { error });
+      throw new Error(`Security audit failed: ${error}`);
     }
   }
 
@@ -294,7 +473,7 @@ export class SessionManager {
    */
   async cleanupInactiveSessions(): Promise<{ cleaned: number; errors: string[] }> {
     try {
-      this.logger('info', 'Starting cleanup of inactive sessions');
+      this.logger.info(, 'Starting cleanup of inactive sessions');
       
       const errors: string[] = [];
       let cleanedCount = 0;
@@ -310,7 +489,7 @@ export class SessionManager {
           const lastAccessed = lastAccessedLabel ? new Date(lastAccessedLabel) : container.created;
 
           if (lastAccessed < cutoffTime && container.status !== 'exited') {
-            this.logger('info', 'Cleaning up inactive session', {
+            this.logger.info(, 'Cleaning up inactive session', {
               containerId: container.id,
               containerName: container.name,
               lastAccessed,
@@ -335,7 +514,7 @@ export class SessionManager {
       // Also cleanup any orphaned worktrees
       await this.cleanupOrphanedWorktrees();
 
-      this.logger('info', 'Cleanup completed', { 
+      this.logger.info(, 'Cleanup completed', { 
         cleanedCount, 
         errorCount: errors.length 
       });
@@ -354,13 +533,13 @@ export class SessionManager {
     try {
       // This would require implementing a method to scan the worktrees directory
       // and check if corresponding containers exist
-      this.logger('info', 'Cleaning up orphaned worktrees');
+      this.logger.info(, 'Cleaning up orphaned worktrees');
       
       // Implementation would scan the worktrees directory and remove
       // any worktrees that don't have corresponding active containers
       
     } catch (error) {
-      this.logger('warn', 'Failed to cleanup orphaned worktrees', { error });
+      this.logger.warn(, 'Failed to cleanup orphaned worktrees', { error });
     }
   }
 
@@ -486,7 +665,7 @@ export class SessionManager {
         params.userId
       );
     } catch (error) {
-      this.logger('warn', 'Failed to cleanup worktree after session creation failure', {
+      this.logger.warn(, 'Failed to cleanup worktree after session creation failure', {
         userId: params.userId,
         repositoryId: params.repositoryId,
         branchName: params.branchName,
@@ -525,7 +704,7 @@ export class SessionManager {
     metadata?: any
   ): Promise<void> {
     try {
-      this.logger('info', `Session event: ${event}`, {
+      this.logger.info(, `Session event: ${event}`, {
         sessionId,
         event,
         metadata,
@@ -570,7 +749,7 @@ export class SessionManager {
    */
   async shutdown(): Promise<void> {
     try {
-      this.logger('info', 'Shutting down session manager');
+      this.logger.info(, 'Shutting down session manager');
       
       // Stop all active sessions gracefully
       const userSessions = await this.dockerService.listContainers();
@@ -586,7 +765,7 @@ export class SessionManager {
         }
       }
 
-      this.logger('info', 'Session manager shutdown complete');
+      this.logger.info(, 'Session manager shutdown complete');
     } catch (error) {
       this.logger('error', 'Error during session manager shutdown', { error });
       throw error;

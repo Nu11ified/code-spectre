@@ -3,9 +3,12 @@ import { createTRPCRouter, protectedProcedure, adminProcedure } from "@/server/a
 import { repositories, permissions, ideSessions } from "@/server/db/schema";
 import { eq, and, desc } from "drizzle-orm";
 import { getCustomUserIdFromAuthId } from "@/lib/user-utils";
-import { TRPCError } from "@trpc/server";
 import { getSessionManager } from "@/server/services/session-manager";
+import { getDockerService } from "@/server/services/docker";
 import type { UserPermissions } from "@/types/domain";
+import { AppError, ErrorCode } from "@/lib/errors";
+import { createTimer } from "@/lib/logger";
+import { TRPCError } from "@trpc/server";
 
 // Validation schemas for session operations
 const sessionStartSchema = z.object({
@@ -26,78 +29,107 @@ export const sessionRouter = createTRPCRouter({
   start: protectedProcedure
     .input(sessionStartSchema)
     .mutation(async ({ input, ctx }) => {
-      const customUserId = await getCustomUserIdFromAuthId(ctx.session.user.id);
-      if (!customUserId) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Failed to find user in custom table",
-        });
-      }
-
-      // Get user permissions for this repository
-      const permission = await ctx.db
-        .select({
-          canCreateBranches: permissions.canCreateBranches,
-          branchLimit: permissions.branchLimit,
-          allowedBaseBranches: permissions.allowedBaseBranches,
-          allowTerminalAccess: permissions.allowTerminalAccess,
-          repositoryName: repositories.name,
-          gitUrl: repositories.gitUrl,
-        })
-        .from(permissions)
-        .innerJoin(repositories, eq(permissions.repositoryId, repositories.id))
-        .where(
-          and(
-            eq(permissions.userId, customUserId),
-            eq(permissions.repositoryId, input.repositoryId)
-          )
-        )
-        .limit(1);
-
-      if (permission.length === 0) {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message: "You do not have permission to access this repository",
-        });
-      }
-
-      const userPermission = permission[0]!;
-
-      // Check if there's already an active session for this user/repo/branch
-      const existingSession = await ctx.db
-        .select()
-        .from(ideSessions)
-        .where(
-          and(
-            eq(ideSessions.userId, customUserId),
-            eq(ideSessions.repositoryId, input.repositoryId),
-            eq(ideSessions.branchName, input.branchName),
-            eq(ideSessions.status, 'running')
-          )
-        )
-        .limit(1);
-
-      if (existingSession.length > 0) {
-        const session = existingSession[0]!;
-        
-        // Update last accessed time
-        await ctx.db
-          .update(ideSessions)
-          .set({ 
-            lastAccessedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(ideSessions.id, session.id));
-
-        return {
-          sessionId: session.containerId,
-          containerUrl: session.containerUrl,
-          status: session.status,
-          message: "Existing session found and reactivated",
-        };
-      }
+      const timer = createTimer(ctx.logger, 'session.start', {
+        repositoryId: input.repositoryId,
+        branchName: input.branchName,
+        userId: ctx.session.user.id,
+      });
 
       try {
+        const customUserId = await getCustomUserIdFromAuthId(ctx.session.user.id);
+        if (!customUserId) {
+          throw new AppError(
+            ErrorCode.USER_NOT_FOUND,
+            "User not found in system",
+            404,
+            true,
+            { authUserId: ctx.session.user.id }
+          );
+        }
+
+        // Get user permissions for this repository
+        const permission = await ctx.db
+          .select({
+            canCreateBranches: permissions.canCreateBranches,
+            branchLimit: permissions.branchLimit,
+            allowedBaseBranches: permissions.allowedBaseBranches,
+            allowTerminalAccess: permissions.allowTerminalAccess,
+            repositoryName: repositories.name,
+            gitUrl: repositories.gitUrl,
+          })
+          .from(permissions)
+          .innerJoin(repositories, eq(permissions.repositoryId, repositories.id))
+          .where(
+            and(
+              eq(permissions.userId, customUserId),
+              eq(permissions.repositoryId, input.repositoryId)
+            )
+          )
+          .limit(1);
+
+        if (permission.length === 0) {
+          throw new AppError(
+            ErrorCode.FORBIDDEN,
+            "You do not have permission to access this repository",
+            403,
+            true,
+            { 
+              userId: customUserId,
+              repositoryId: input.repositoryId 
+            }
+          );
+        }
+
+        const userPermission = permission[0]!;
+
+        ctx.logger.info('Starting IDE session', {
+          userId: customUserId,
+          repositoryId: input.repositoryId,
+          repositoryName: userPermission.repositoryName,
+          branchName: input.branchName,
+        });
+
+        // Check if there's already an active session for this user/repo/branch
+        const existingSession = await ctx.db
+          .select()
+          .from(ideSessions)
+          .where(
+            and(
+              eq(ideSessions.userId, customUserId),
+              eq(ideSessions.repositoryId, input.repositoryId),
+              eq(ideSessions.branchName, input.branchName),
+              eq(ideSessions.status, 'running')
+            )
+          )
+          .limit(1);
+
+        if (existingSession.length > 0) {
+          const session = existingSession[0]!;
+          
+          ctx.logger.info('Reusing existing session', {
+            sessionId: session.containerId,
+            userId: customUserId,
+          });
+          
+          // Update last accessed time
+          await ctx.db
+            .update(ideSessions)
+            .set({ 
+              lastAccessedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(ideSessions.id, session.id));
+
+          timer.end({ reused: true });
+
+          return {
+            sessionId: session.containerId,
+            containerUrl: session.containerUrl,
+            status: session.status,
+            message: "Existing session found and reactivated",
+          };
+        }
+
         // Create session using SessionManager
         const sessionManager = getSessionManager();
         
@@ -131,6 +163,19 @@ export const sessionRouter = createTRPCRouter({
           })
           .returning();
 
+        timer.end({
+          sessionId: sessionInfo.sessionId,
+          dbSessionId: dbSession?.id,
+          success: true,
+        });
+
+        ctx.logger.info('IDE session created successfully', {
+          sessionId: sessionInfo.sessionId,
+          userId: customUserId,
+          repositoryId: input.repositoryId,
+          branchName: input.branchName,
+        });
+
         return {
           sessionId: sessionInfo.sessionId,
           containerUrl: sessionInfo.containerUrl,
@@ -139,10 +184,17 @@ export const sessionRouter = createTRPCRouter({
           dbSessionId: dbSession?.id,
         };
       } catch (error) {
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: `Failed to create IDE session: ${error}`,
+        timer.endWithError(error);
+        
+        // Handle and convert error
+        const handledError = ctx.errorHandler.handleError(error, {
+          operation: 'session.start',
+          repositoryId: input.repositoryId,
+          branchName: input.branchName,
+          userId: ctx.session.user.id,
         });
+
+        throw handledError.toTRPCError();
       }
     }),
 
@@ -506,4 +558,111 @@ export const sessionRouter = createTRPCRouter({
       });
     }
   }),
+
+  /**
+   * Validate terminal command before execution
+   */
+  validateCommand: protectedProcedure
+    .input(z.object({
+      sessionId: z.string().min(1, "Session ID is required"),
+      command: z.string().min(1, "Command is required"),
+    }))
+    .query(async ({ input, ctx }) => {
+      const customUserId = await getCustomUserIdFromAuthId(ctx.session.user.id);
+      if (!customUserId) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to find user in custom table",
+        });
+      }
+
+      // Verify user owns this session
+      const session = await ctx.db
+        .select()
+        .from(ideSessions)
+        .where(
+          and(
+            eq(ideSessions.containerId, input.sessionId),
+            eq(ideSessions.userId, customUserId)
+          )
+        )
+        .limit(1);
+
+      if (session.length === 0) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Session not found or you don't have permission to access it",
+        });
+      }
+
+      try {
+        const sessionManager = getSessionManager();
+        const validation = await sessionManager.validateTerminalCommand(input.sessionId, input.command);
+        
+        return {
+          allowed: validation.allowed,
+          reason: validation.reason,
+          command: input.command,
+          sessionId: input.sessionId,
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `Failed to validate command: ${error}`,
+        });
+      }
+    }),
+
+  /**
+   * Get session security status
+   */
+  getSessionSecurity: protectedProcedure
+    .input(z.object({
+      sessionId: z.string().min(1, "Session ID is required"),
+    }))
+    .query(async ({ input, ctx }) => {
+      const customUserId = await getCustomUserIdFromAuthId(ctx.session.user.id);
+      if (!customUserId) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Failed to find user in custom table",
+        });
+      }
+
+      // Verify user owns this session
+      const session = await ctx.db
+        .select()
+        .from(ideSessions)
+        .where(
+          and(
+            eq(ideSessions.containerId, input.sessionId),
+            eq(ideSessions.userId, customUserId)
+          )
+        )
+        .limit(1);
+
+      if (session.length === 0) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Session not found or you don't have permission to access it",
+        });
+      }
+
+      try {
+        const dockerService = getDockerService();
+        const securityInfo = await dockerService.monitorContainerSecurity(input.sessionId);
+        
+        return {
+          sessionId: input.sessionId,
+          compliant: securityInfo.compliant,
+          violations: securityInfo.violations,
+          resourceUsage: securityInfo.resourceUsage,
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `Failed to get session security info: ${error}`,
+        });
+      }
+    }),
 });

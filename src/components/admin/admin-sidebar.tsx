@@ -35,6 +35,11 @@ const navigation = [
     icon: Shield,
   },
   {
+    name: "Security",
+    href: "/admin/security",
+    icon: Settings,
+  },
+  {
     name: "Extensions",
     href: "/admin/extensions",
     icon: Puzzle,

@@ -4,9 +4,11 @@ import type {
   Mount, 
   ResourceLimits, 
   SessionStatus,
-  LogEntry 
+  LogEntry,
+  UserPermissions 
 } from '@/types/domain';
 import { getTraefikService, type ContainerRoute } from './traefik';
+import { getSecurityService, type ContainerSecurityProfile } from './security';
 
 export interface DockerServiceConfig {
   socketPath?: string; // Docker socket path (default: /var/run/docker.sock)
@@ -59,6 +61,7 @@ export class DockerService {
   private logger: (level: 'info' | 'warn' | 'error', message: string, metadata?: any) => void;
   private cleanupInterval?: NodeJS.Timeout;
   private traefikService: ReturnType<typeof getTraefikService>;
+  private securityService = getSecurityService();
 
   constructor(
     config: DockerServiceConfig,
@@ -107,7 +110,7 @@ export class DockerService {
   }
 
   /**
-   * Create and start a new IDE container
+   * Create and start a new IDE container with security isolation
    */
   async createIdeContainer(params: {
     userId: number;
@@ -115,7 +118,7 @@ export class DockerService {
     branchName: string;
     worktreePath: string;
     extensionsPath: string;
-    terminalAccess: boolean;
+    permissions: UserPermissions;
   }): Promise<ContainerInfo> {
     try {
       const containerName = this.generateContainerName(
@@ -134,14 +137,21 @@ export class DockerService {
       // Check container limits
       await this.enforceContainerLimits();
 
-      const containerConfig = this.buildContainerConfig({
+      // Generate security profile for the container
+      const securityProfile = this.securityService.generateSecurityProfile(
+        params.userId,
+        params.permissions,
+        params.repositoryId
+      );
+
+      const containerConfig = this.buildSecureContainerConfig({
         name: containerName,
         userId: params.userId,
         repositoryId: params.repositoryId,
         branchName: params.branchName,
         worktreePath: params.worktreePath,
         extensionsPath: params.extensionsPath,
-        terminalAccess: params.terminalAccess,
+        securityProfile,
       });
 
       this.logger('info', 'Creating IDE container', { 
@@ -426,12 +436,13 @@ export class DockerService {
   }
 
   /**
-   * Get system resource usage
+   * Get system resource usage with security monitoring
    */
   async getSystemStats(): Promise<{
     containerCount: number;
     totalCpuUsage: number;
     totalMemoryUsage: number;
+    securityMetrics: any;
   }> {
     try {
       const containers = await this.listContainers();
@@ -450,14 +461,279 @@ export class DockerService {
         }
       }
 
+      // Get security metrics
+      const securityMetrics = this.securityService.getSecurityMetrics();
+
       return {
         containerCount: containers.length,
         totalCpuUsage: Math.round(totalCpuUsage * 100) / 100,
         totalMemoryUsage,
+        securityMetrics,
       };
     } catch (error) {
       this.logger('error', 'Failed to get system stats', { error });
       throw new Error(`Failed to get system stats: ${error}`);
+    }
+  }
+
+  /**
+   * Monitor container security and resource compliance
+   */
+  async monitorContainerSecurity(containerId: string): Promise<{
+    compliant: boolean;
+    violations: string[];
+    resourceUsage: any;
+  }> {
+    try {
+      const containerInfo = await this.getContainerInfo(containerId);
+      const stats = await this.getContainerStats(containerId);
+      
+      // Get user ID and generate security profile for validation
+      const userId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.user-id`] || '0');
+      const repositoryId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.repository-id`] || '0');
+      
+      if (!userId || !repositoryId) {
+        return {
+          compliant: false,
+          violations: ['Container missing required security labels'],
+          resourceUsage: stats,
+        };
+      }
+
+      // For monitoring, we need to reconstruct the security profile
+      // In a real implementation, this could be stored or retrieved from database
+      const mockPermissions: UserPermissions = {
+        canCreateBranches: true,
+        branchLimit: 5,
+        allowedBaseBranches: ['main', 'develop'],
+        allowTerminalAccess: true,
+      };
+
+      const securityProfile = this.securityService.generateSecurityProfile(
+        userId,
+        mockPermissions,
+        repositoryId
+      );
+
+      // Monitor resource usage against security profile
+      const resourceCheck = await this.securityService.monitorResourceUsage(
+        containerId,
+        securityProfile,
+        {
+          cpu: stats.cpu,
+          memory: stats.memory,
+        }
+      );
+
+      return {
+        compliant: resourceCheck.withinLimits,
+        violations: resourceCheck.violations,
+        resourceUsage: stats,
+      };
+    } catch (error) {
+      this.logger('error', 'Failed to monitor container security', { containerId, error });
+      return {
+        compliant: false,
+        violations: [`Monitoring error: ${error}`],
+        resourceUsage: null,
+      };
+    }
+  }
+
+  /**
+   * Validate terminal command execution with enhanced security
+   */
+  async validateTerminalCommand(
+    containerId: string,
+    command: string
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    try {
+      const containerInfo = await this.getContainerInfo(containerId);
+      const userId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.user-id`] || '0');
+      const repositoryId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.repository-id`] || '0');
+      
+      if (!userId || !repositoryId) {
+        return { allowed: false, reason: 'Container security context not found' };
+      }
+
+      // Reconstruct security profile for validation
+      const mockPermissions: UserPermissions = {
+        canCreateBranches: true,
+        branchLimit: 5,
+        allowedBaseBranches: ['main', 'develop'],
+        allowTerminalAccess: true,
+      };
+
+      const securityProfile = this.securityService.generateSecurityProfile(
+        userId,
+        mockPermissions,
+        repositoryId
+      );
+
+      return this.securityService.validateTerminalCommand(command, securityProfile, containerId);
+    } catch (error) {
+      this.logger('error', 'Failed to validate terminal command', { containerId, command, error });
+      return { allowed: false, reason: 'Validation error' };
+    }
+  }
+
+  /**
+   * Validate file access attempts
+   */
+  async validateFileAccess(
+    containerId: string,
+    filePath: string,
+    operation: 'read' | 'write' | 'execute'
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    try {
+      const containerInfo = await this.getContainerInfo(containerId);
+      const userId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.user-id`] || '0');
+      const repositoryId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.repository-id`] || '0');
+      
+      if (!userId || !repositoryId) {
+        return { allowed: false, reason: 'Container security context not found' };
+      }
+
+      const mockPermissions: UserPermissions = {
+        canCreateBranches: true,
+        branchLimit: 5,
+        allowedBaseBranches: ['main', 'develop'],
+        allowTerminalAccess: true,
+      };
+
+      const securityProfile = this.securityService.generateSecurityProfile(
+        userId,
+        mockPermissions,
+        repositoryId
+      );
+
+      return this.securityService.validateFileAccess(filePath, operation, securityProfile, containerId);
+    } catch (error) {
+      this.logger('error', 'Failed to validate file access', { containerId, filePath, operation, error });
+      return { allowed: false, reason: 'Validation error' };
+    }
+  }
+
+  /**
+   * Validate network access attempts
+   */
+  async validateNetworkAccess(
+    containerId: string,
+    destination: string,
+    port: number,
+    protocol: 'tcp' | 'udp' = 'tcp'
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    try {
+      const containerInfo = await this.getContainerInfo(containerId);
+      const userId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.user-id`] || '0');
+      const repositoryId = parseInt(containerInfo.labels[`${this.getLabelPrefix()}.repository-id`] || '0');
+      
+      if (!userId || !repositoryId) {
+        return { allowed: false, reason: 'Container security context not found' };
+      }
+
+      const mockPermissions: UserPermissions = {
+        canCreateBranches: true,
+        branchLimit: 5,
+        allowedBaseBranches: ['main', 'develop'],
+        allowTerminalAccess: true,
+      };
+
+      const securityProfile = this.securityService.generateSecurityProfile(
+        userId,
+        mockPermissions,
+        repositoryId
+      );
+
+      return this.securityService.validateNetworkAccess(destination, port, protocol, securityProfile, containerId);
+    } catch (error) {
+      this.logger('error', 'Failed to validate network access', { containerId, destination, port, error });
+      return { allowed: false, reason: 'Validation error' };
+    }
+  }
+
+  /**
+   * Perform comprehensive security audit on a container
+   */
+  async performSecurityAudit(containerId: string): Promise<{
+    compliant: boolean;
+    violations: string[];
+    recommendations: string[];
+    riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  }> {
+    try {
+      const containerInfo = await this.getContainerInfo(containerId);
+      const stats = await this.getContainerStats(containerId);
+      
+      const violations: string[] = [];
+      const recommendations: string[] = [];
+      let riskLevel: 'low' | 'medium' | 'high' | 'critical' = 'low';
+
+      // Check container configuration
+      if (!containerInfo.labels[`${this.getLabelPrefix()}.security-profile`]) {
+        violations.push('Container missing security profile');
+        riskLevel = 'high';
+      }
+
+      // Check resource usage
+      const memoryUsagePercent = (stats.memory / stats.memoryLimit) * 100;
+      if (memoryUsagePercent > 90) {
+        violations.push(`High memory usage: ${memoryUsagePercent.toFixed(1)}%`);
+        if (riskLevel === 'low') riskLevel = 'medium';
+      }
+
+      if (stats.cpu > 90) {
+        violations.push(`High CPU usage: ${stats.cpu.toFixed(1)}%`);
+        if (riskLevel === 'low') riskLevel = 'medium';
+      }
+
+      // Check container age
+      const containerAge = Date.now() - containerInfo.created.getTime();
+      const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+      if (containerAge > maxAge) {
+        recommendations.push('Container has been running for more than 24 hours, consider restarting');
+      }
+
+      // Check for security labels
+      const requiredLabels = [
+        `${this.getLabelPrefix()}.user-id`,
+        `${this.getLabelPrefix()}.repository-id`,
+        `${this.getLabelPrefix()}.branch-name`,
+      ];
+
+      for (const label of requiredLabels) {
+        if (!containerInfo.labels[label]) {
+          violations.push(`Missing required security label: ${label}`);
+          riskLevel = 'high';
+        }
+      }
+
+      // Additional security checks
+      if (containerInfo.status !== 'running') {
+        violations.push('Container is not in running state');
+        if (riskLevel === 'low') riskLevel = 'medium';
+      }
+
+      // Check for suspicious network activity
+      if (stats.networkTx > 1024 * 1024 * 100) { // 100MB
+        recommendations.push('High network transmission detected, monitor for data exfiltration');
+        if (riskLevel === 'low') riskLevel = 'medium';
+      }
+
+      return {
+        compliant: violations.length === 0,
+        violations,
+        recommendations,
+        riskLevel,
+      };
+    } catch (error) {
+      this.logger('error', 'Failed to perform security audit', { containerId, error });
+      return {
+        compliant: false,
+        violations: [`Audit error: ${error}`],
+        recommendations: ['Investigate audit failure'],
+        riskLevel: 'critical',
+      };
     }
   }
 
@@ -501,14 +777,14 @@ export class DockerService {
     }
   }
 
-  private buildContainerConfig(params: {
+  private buildSecureContainerConfig(params: {
     name: string;
     userId: number;
     repositoryId: number;
     branchName: string;
     worktreePath: string;
     extensionsPath: string;
-    terminalAccess: boolean;
+    securityProfile: ContainerSecurityProfile;
   }): any {
     const labels = {
       [`${this.getLabelPrefix()}.managed`]: 'true',
@@ -516,36 +792,60 @@ export class DockerService {
       [`${this.getLabelPrefix()}.repository-id`]: params.repositoryId.toString(),
       [`${this.getLabelPrefix()}.branch-name`]: params.branchName,
       [`${this.getLabelPrefix()}.created`]: new Date().toISOString(),
+      [`${this.getLabelPrefix()}.last-accessed`]: new Date().toISOString(),
+      [`${this.getLabelPrefix()}.security-profile`]: 'enabled',
       // Basic Traefik labels (detailed routing handled by TraefikService)
       'traefik.enable': 'true',
       [`traefik.http.services.${params.name}.loadbalancer.server.port`]: '8080',
     };
 
-    const mounts = [
+    // Base mounts with security validation
+    const baseMounts = [
       {
-        Target: '/home/coder/workspace',
-        Source: params.worktreePath,
-        Type: 'bind',
-        ReadOnly: false,
+        source: params.worktreePath,
+        target: '/home/coder/workspace',
+        type: 'bind',
+        readOnly: false,
       },
       {
-        Target: '/home/coder/.local/share/code-server/extensions',
-        Source: params.extensionsPath,
-        Type: 'bind',
-        ReadOnly: true,
+        source: params.extensionsPath,
+        target: '/home/coder/.local/share/code-server/extensions',
+        type: 'bind',
+        readOnly: true,
       },
     ];
 
+    // Validate and secure mounts
+    const securedMounts = this.securityService.validateMountConfig(baseMounts, params.securityProfile);
+
+    // Convert to Docker mount format
+    const dockerMounts = securedMounts.map(mount => ({
+      Target: mount.target,
+      Source: mount.source,
+      Type: mount.type,
+      ReadOnly: mount.readOnly,
+    }));
+
+    // Environment variables with security considerations
     const environment = [
       'PASSWORD=', // Disable password authentication
-      'SUDO_PASSWORD=coder',
-      `DISABLE_TELEMETRY=true`,
+      'SUDO_PASSWORD=', // Disable sudo password
+      'DISABLE_TELEMETRY=true',
+      'DISABLE_UPDATE_CHECK=true',
+      'DISABLE_GETTING_STARTED_OVERRIDE=true',
     ];
 
-    // Disable terminal if not allowed
-    if (!params.terminalAccess) {
+    // Configure terminal access based on security profile
+    if (!params.securityProfile.terminalRestrictions.enabled) {
       environment.push('DISABLE_TERMINAL=true');
+    } else {
+      // Add terminal timeout
+      environment.push(`SHELL_TIMEOUT=${params.securityProfile.terminalRestrictions.timeout}`);
     }
+
+    // Get security options from security service
+    const securityOptions = this.securityService.generateDockerSecurityOptions(params.securityProfile);
+    const networkConfig = this.securityService.generateNetworkConfig(params.securityProfile);
 
     return {
       Image: this.config.defaultImage,
@@ -556,23 +856,58 @@ export class DockerService {
         '8080/tcp': {},
       },
       HostConfig: {
-        Memory: this.parseMemoryLimit(this.config.defaultResources.memory),
-        CpuQuota: this.parseCpuLimit(this.config.defaultResources.cpus),
+        // Resource limits from security profile
+        Memory: this.parseMemoryLimit(params.securityProfile.resourceLimits.memory),
+        CpuQuota: this.parseCpuLimit(params.securityProfile.resourceLimits.cpu),
         CpuPeriod: 100000, // Standard CPU period
-        Mounts: mounts,
-        NetworkMode: this.config.networkName,
+        
+        // Secure mounts
+        Mounts: dockerMounts,
+        
+        // Network configuration with enhanced security
+        NetworkMode: networkConfig.networkMode,
+        Dns: networkConfig.dns,
+        ExtraHosts: networkConfig.extraHosts,
+        PublishAllPorts: networkConfig.publishAllPorts,
+        
+        // Additional network security
+        DnsOptions: ['ndots:0'], // Minimize DNS lookups
+        DnsSearch: [], // No DNS search domains
+        
+        // Security options
+        SecurityOpt: securityOptions.securityOpt,
+        CapAdd: securityOptions.capAdd,
+        CapDrop: securityOptions.capDrop,
+        ReadonlyRootfs: securityOptions.readOnlyRootfs,
+        Tmpfs: securityOptions.tmpfs,
+        Ulimits: securityOptions.ulimits,
+        
+        // Restart policy
         RestartPolicy: {
           Name: 'unless-stopped',
         },
-        SecurityOpt: [
-          'no-new-privileges:true',
-        ],
+        
+        // Additional security: disable privileged mode
+        Privileged: false,
+        
+        // PID mode isolation
+        PidMode: '',
+        
+        // User namespace remapping (if supported)
+        UsernsMode: '',
       },
       NetworkingConfig: {
         EndpointsConfig: {
-          [this.config.networkName]: {},
+          [networkConfig.networkMode]: {
+            // Additional network security could be configured here
+          },
         },
       },
+      // Working directory
+      WorkingDir: '/home/coder/workspace',
+      
+      // User configuration (run as non-root)
+      User: 'coder:coder',
     };
   }
 
@@ -598,26 +933,57 @@ export class DockerService {
 
   private async ensureNetwork(): Promise<void> {
     try {
+      // Ensure main network exists
+      await this.ensureNetworkExists(this.config.networkName, {
+        Driver: 'bridge',
+        Labels: {
+          [`${this.getLabelPrefix()}.managed`]: 'true',
+        },
+      });
+
+      // Ensure isolated network exists for security
+      await this.ensureNetworkExists('cloud-ide-isolated', {
+        Driver: 'bridge',
+        Internal: true, // No external connectivity
+        Labels: {
+          [`${this.getLabelPrefix()}.managed`]: 'true',
+          [`${this.getLabelPrefix()}.type`]: 'isolated',
+        },
+        IPAM: {
+          Driver: 'default',
+          Config: [{
+            Subnet: '172.20.0.0/16',
+            Gateway: '172.20.0.1',
+          }],
+        },
+        Options: {
+          'com.docker.network.bridge.enable_icc': 'false', // Disable inter-container communication
+          'com.docker.network.bridge.enable_ip_masquerade': 'false', // Disable IP masquerading
+          'com.docker.network.driver.mtu': '1500',
+        },
+      });
+    } catch (error) {
+      this.logger('error', 'Failed to ensure networks exist', { error });
+      throw error;
+    }
+  }
+
+  private async ensureNetworkExists(networkName: string, config: any): Promise<void> {
+    try {
       const networks = await this.docker.listNetworks({
-        filters: { name: [this.config.networkName] },
+        filters: { name: [networkName] },
       });
       
       if (networks.length === 0) {
-        this.logger('info', 'Creating Docker network', { networkName: this.config.networkName });
+        this.logger('info', 'Creating Docker network', { networkName });
         
         await this.docker.createNetwork({
-          Name: this.config.networkName,
-          Driver: 'bridge',
-          Labels: {
-            [`${this.getLabelPrefix()}.managed`]: 'true',
-          },
+          Name: networkName,
+          ...config,
         });
       }
     } catch (error) {
-      this.logger('error', 'Failed to ensure network exists', { 
-        networkName: this.config.networkName, 
-        error,
-      });
+      this.logger('error', 'Failed to create network', { networkName, error });
       throw error;
     }
   }

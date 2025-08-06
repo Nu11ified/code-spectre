@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { DockerService, createDefaultDockerConfig } from '../docker';
 import { TraefikService, createDefaultTraefikConfig } from '../traefik';
+import type { UserPermissions } from '@/types/domain';
 
 // Integration tests for Traefik + Docker service
 // These tests require Docker to be available and will create real containers
@@ -85,7 +86,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
         branchName: 'main',
         worktreePath: '/tmp/test-worktree',
         extensionsPath: '/tmp/test-extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       testContainers.push(containerInfo.id);
@@ -116,7 +122,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
         branchName: 'feature/complex-branch_name@123',
         worktreePath: '/tmp/test-worktree-2',
         extensionsPath: '/tmp/test-extensions',
-        terminalAccess: false,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: false,
+        },
       });
 
       testContainers.push(containerInfo.id);
@@ -133,7 +144,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
         branchName: 'develop',
         worktreePath: '/tmp/test-worktree-3',
         extensionsPath: '/tmp/test-extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       testContainers.push(containerInfo1.id);
@@ -145,7 +161,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
         branchName: 'develop',
         worktreePath: '/tmp/test-worktree-3',
         extensionsPath: '/tmp/test-extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       // Should return the same container
@@ -163,7 +184,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
         branchName: 'test-removal',
         worktreePath: '/tmp/test-worktree-4',
         extensionsPath: '/tmp/test-extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       const containerId = containerInfo.id;
@@ -194,7 +220,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
         branchName: 'route-test',
         worktreePath: '/tmp/test-worktree-5',
         extensionsPath: '/tmp/test-extensions',
-        terminalAccess: true,
+        permissions: {
+          canCreateBranches: true,
+          branchLimit: 5,
+          allowedBaseBranches: ['main', 'develop'],
+          allowTerminalAccess: true,
+        },
       });
 
       testContainers.push(containerInfo.id);
@@ -240,7 +271,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
           branchName: 'multi-1',
           worktreePath: '/tmp/test-worktree-6',
           extensionsPath: '/tmp/test-extensions',
-          terminalAccess: true,
+          permissions: {
+            canCreateBranches: true,
+            branchLimit: 5,
+            allowedBaseBranches: ['main', 'develop'],
+            allowTerminalAccess: true,
+          },
         }),
         dockerService.createIdeContainer({
           userId: 7,
@@ -248,7 +284,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
           branchName: 'multi-2',
           worktreePath: '/tmp/test-worktree-7',
           extensionsPath: '/tmp/test-extensions',
-          terminalAccess: false,
+          permissions: {
+            canCreateBranches: true,
+            branchLimit: 5,
+            allowedBaseBranches: ['main', 'develop'],
+            allowTerminalAccess: false,
+          },
         }),
         dockerService.createIdeContainer({
           userId: 8,
@@ -256,7 +297,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
           branchName: 'multi-3',
           worktreePath: '/tmp/test-worktree-8',
           extensionsPath: '/tmp/test-extensions',
-          terminalAccess: true,
+          permissions: {
+            canCreateBranches: true,
+            branchLimit: 5,
+            allowedBaseBranches: ['main', 'develop'],
+            allowTerminalAccess: true,
+          },
         }),
       ]);
 
@@ -295,7 +341,12 @@ describe.skipIf(SKIP_INTEGRATION_TESTS)('Traefik Integration Tests', () => {
           branchName: 'error-test',
           worktreePath: '/tmp/test-worktree-error',
           extensionsPath: '/tmp/test-extensions',
-          terminalAccess: true,
+          permissions: {
+            canCreateBranches: true,
+            branchLimit: 5,
+            allowedBaseBranches: ['main', 'develop'],
+            allowTerminalAccess: true,
+          },
         })
       ).rejects.toThrow();
 

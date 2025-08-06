@@ -76,7 +76,7 @@
   - Create session management interface showing active sessions
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 4.4, 7.1_
 
-- [-] 11. Implement security and isolation features
+- [x] 11. Implement security and isolation features
   - Configure container networking restrictions
   - Implement file system isolation with proper mount configurations
   - Add terminal access control based on user permissions
@@ -84,7 +84,7 @@
   - Implement container resource limits and monitoring
   - _Requirements: 8.1, 8.2, 8.3, 8.4, 10.1, 10.2, 10.3, 10.4, 10.5_
 
-- [ ] 12. Add comprehensive error handling and logging
+- [-] 12. Add comprehensive error handling and logging
   - Implement structured logging throughout the application
   - Create error handling middleware for tRPC procedures
   - Add user-friendly error messages for common failure scenarios
