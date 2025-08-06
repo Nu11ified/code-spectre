@@ -5,7 +5,6 @@ import { useAuth } from "@/hooks/use-auth";
 import { api } from "@/trpc/react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { RepositoryCard } from "./repository-card";
 import { SessionManager } from "./session-manager";
@@ -77,8 +76,8 @@ export function UserDashboard() {
             </div>
             <Button
               onClick={() => {
-                refetchRepositories();
-                refetchSessions();
+                void refetchRepositories();
+                void refetchSessions();
               }}
               variant="outline"
               size="sm"
@@ -104,7 +103,7 @@ export function UserDashboard() {
                 {repositoriesLoading ? (
                   <Skeleton className="h-8 w-16 bg-white/20" />
                 ) : (
-                  repositories?.length || 0
+                  repositories?.length ?? 0
                 )}
               </div>
             </CardContent>
@@ -122,7 +121,7 @@ export function UserDashboard() {
                 {sessionsLoading ? (
                   <Skeleton className="h-8 w-16 bg-white/20" />
                 ) : (
-                  sessions?.filter(s => s.status === 'running').length || 0
+                  sessions?.filter(s => s.status === 'running').length ?? 0
                 )}
               </div>
             </CardContent>
@@ -140,7 +139,7 @@ export function UserDashboard() {
                 {sessionsLoading ? (
                   <Skeleton className="h-8 w-16 bg-white/20" />
                 ) : (
-                  sessions?.length || 0
+                  sessions?.length ?? 0
                 )}
               </div>
             </CardContent>

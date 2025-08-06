@@ -94,7 +94,7 @@ export function CreateBranchModal({
   });
 
   // Fetch branch stats to get allowed base branches
-  const { data: branchStats, isLoading: statsLoading } = api.dashboard.getBranchStats.useQuery(
+  const { data: branchStats } = api.dashboard.getBranchStats.useQuery(
     { repositoryId },
     { enabled: isOpen }
   );

@@ -68,7 +68,7 @@
   - Add extension management interface with search and install functionality
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 5.1, 5.2, 5.3, 5.4_
 
-- [ ] 10. Build user dashboard frontend components
+- [x] 10. Build user dashboard frontend components
   - Create user dashboard layout showing accessible repositories
   - Implement repository cards with branch selection interface
   - Build branch creation modal with validation feedback
@@ -76,7 +76,7 @@
   - Create session management interface showing active sessions
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 4.4, 7.1_
 
-- [ ] 11. Implement security and isolation features
+- [-] 11. Implement security and isolation features
   - Configure container networking restrictions
   - Implement file system isolation with proper mount configurations
   - Add terminal access control based on user permissions

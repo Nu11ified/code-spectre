@@ -18,7 +18,6 @@ import {
   Play, 
   Plus, 
   Terminal,
-  TerminalSquare,
   AlertCircle,
   RefreshCw
 } from "lucide-react";
@@ -150,7 +149,7 @@ export function RepositoryCard({
                 <Button
                   onClick={(e) => {
                     e.stopPropagation();
-                    refetchBranches();
+                    void refetchBranches();
                   }}
                   variant="ghost"
                   size="sm"
