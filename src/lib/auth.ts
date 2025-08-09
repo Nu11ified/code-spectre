@@ -1,62 +1,33 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { createAuthMiddleware } from "better-auth/api";
-import { db } from "@/server/db"; // your drizzle instance
-import { users } from "@/server/db/schema";
+import { nextCookies } from "better-auth/next-js";
+
+import { db } from "@/server/db";
 import { env } from "@/env";
-import { eq } from "drizzle-orm";
 
 export const auth = betterAuth({
-    database: drizzleAdapter(db, {
-        provider: "pg", // or "mysql", "sqlite"
-    }),
-    socialProviders: {
-        github: {
-            clientId: env.GITHUB_CLIENT_ID,
-            clientSecret: env.GITHUB_CLIENT_SECRET,
-            scope: ["user:email", "repo", "admin:repo_hook", "admin:public_key"],
-        },
+  database: drizzleAdapter(db, {
+    provider: "pg",
+    // If we later import Better Auth tables into our Drizzle schema, we can
+    // map them explicitly via `schema: { user: schema.user, ... }`.
+  }),
+  secret: process.env.BETTER_AUTH_SECRET,
+  socialProviders: {
+    github: {
+      clientId: process.env.GITHUB_CLIENT_ID as string,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET as string,
+      mapProfileToUser: (profile: any) => ({
+        // Better Auth default fields
+        name: profile.name ?? profile.login ?? "",
+        email: profile.email,
+        image: profile.avatar_url,
+      }),
     },
-    hooks: {
-        after: createAuthMiddleware(async (ctx) => {
-            // Check if this is a social sign-in or sign-up
-            if (ctx.path === "/sign-up/social" || ctx.path === "/sign-in/social") {
-                const returned = ctx.context.returned as any;
-                const user = returned?.user;
-                if (!user) return;
-
-                // Sync user data to our custom users table
-                try {
-                    // Check if user already exists in our custom table
-                    const existingUser = await db
-                        .select()
-                        .from(users)
-                        .where(eq(users.githubId, user.id))
-                        .limit(1);
-
-                    if (existingUser.length === 0) {
-                        // Create new user in our custom table
-                        await db.insert(users).values({
-                            githubId: user.id,
-                            githubUsername: user.name || "unknown",
-                            email: user.email,
-                            role: user.email === env.ADMIN_EMAIL ? "admin" : "user",
-                        });
-                    } else {
-                        // Update existing user
-                        await db
-                            .update(users)
-                            .set({
-                                githubUsername: user.name || "unknown",
-                                email: user.email,
-                                role: user.email === env.ADMIN_EMAIL ? "admin" : "user",
-                            })
-                            .where(eq(users.githubId, user.id));
-                    }
-                } catch (error) {
-                    console.error("Error syncing user to custom table:", error);
-                }
-            }
-        }),
-    },
+  },
+  // Optionally set base URL if deploying behind a different domain
+  baseURL: process.env.BETTER_AUTH_URL ?? undefined,
+  plugins: [nextCookies()],
 });
+
+export type Auth = typeof auth;
+
